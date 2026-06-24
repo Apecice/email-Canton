@@ -1,0 +1,11 @@
+# 绝不提交真实凭据与采集到的日志/报告
+config.ini
+logs/
+reports/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

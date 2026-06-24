@@ -1,0 +1,3 @@
+# IDLE 模式需要（poll 模式与网络探测仅用标准库，可不装）。
+# Needed only for IDLE mode; poll mode + net probe use the stdlib.
+imapclient>=2.3.1
