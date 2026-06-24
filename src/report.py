@@ -121,24 +121,32 @@ def summarize_netprobe(lines: list[str]) -> None:
     if not rows:
         lines.append("  (no network probe records found)\n")
         return
+    truthy = ("True", "true", "1")
     groups: dict[tuple, dict] = {}
     for r in rows:
         key = (r.get("vantage", "?"), r.get("host", ""), r.get("port", ""))
-        g = groups.setdefault(key, {"tcp": [], "fail": 0, "n": 0})
+        g = groups.setdefault(key, {"tcp": [], "tcp_fail": 0, "tls_fail": 0, "n": 0})
         g["n"] += 1
-        if r.get("ok") in ("True", "true", "1"):
+        # Prefer the explicit tcp_ok signal; fall back to ok for older logs.
+        tcp_ok = r.get("tcp_ok", "") in truthy if r.get("tcp_ok", "") != "" \
+            else r.get("ok") in truthy
+        full_ok = r.get("ok") in truthy
+        if tcp_ok:
             t = _f(r.get("tcp_connect_ms", ""))
             if t is not None:
                 g["tcp"].append(t)
+            if not full_ok:
+                g["tls_fail"] += 1  # connected but TLS handshake failed
         else:
-            g["fail"] += 1
+            g["tcp_fail"] += 1      # genuine connectivity failure
     for (vantage, host, port), g in sorted(groups.items()):
         tcp = g["tcp"]
         med = f"{statistics.median(tcp):.0f}" if tcp else "n/a"
         p95 = f"{(_pct(tcp, 95) or 0):.0f}" if tcp else "n/a"
-        fail_pct = 100 * g["fail"] / g["n"] if g["n"] else 0
+        fail_pct = 100 * g["tcp_fail"] / g["n"] if g["n"] else 0
         lines.append(f"  {vantage} -> {host}:{port}  probes={g['n']}  "
-                     f"fail={g['fail']} ({fail_pct:.0f}%)  "
+                     f"tcp_fail={g['tcp_fail']} ({fail_pct:.0f}%)  "
+                     f"tls_fail={g['tls_fail']}  "
                      f"tcp_connect median={med}ms p95={p95}ms")
     lines.append("")
 

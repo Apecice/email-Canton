@@ -22,18 +22,24 @@ from common import LOG_DIR, iso, load_config, now_utc
 
 FIELDS = [
     "ts", "vantage", "host", "port", "tls",
-    "tcp_connect_ms", "tls_handshake_ms", "ok", "error",
+    "tcp_connect_ms", "tls_handshake_ms", "tcp_ok", "ok", "error",
 ]
 
 
 def probe_once(host: str, port: int, use_tls: bool, timeout: float) -> dict:
+    # tcp_ok = the TCP connection itself succeeded (the real cross-border
+    # connectivity signal). ok = the full probe incl. TLS handshake succeeded.
+    # Keeping them separate means a TLS/cert problem is never mislabelled as
+    # "cannot reach the server".
     row = {"ts": iso(now_utc()), "host": host, "port": port, "tls": use_tls,
-           "tcp_connect_ms": "", "tls_handshake_ms": "", "ok": False, "error": ""}
+           "tcp_connect_ms": "", "tls_handshake_ms": "", "tcp_ok": False,
+           "ok": False, "error": ""}
     sock = None
     try:
         t0 = time.monotonic()
         sock = socket.create_connection((host, port), timeout=timeout)
         row["tcp_connect_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        row["tcp_ok"] = True
         if use_tls:
             ctx = ssl.create_default_context()
             t1 = time.monotonic()

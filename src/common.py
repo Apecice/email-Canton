@@ -11,7 +11,6 @@ import csv
 import hashlib
 import json
 import os
-import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,16 +32,45 @@ def iso(dt: datetime | None) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+class ConfigError(Exception):
+    """Raised for any user-facing configuration problem (missing/invalid)."""
+
+
+# Sections/options that must be present and non-blank for the tool to run.
+REQUIRED_OPTIONS = {"imap": ["host", "user", "password"]}
+
+
 def load_config(path: str | os.PathLike | None = None) -> configparser.ConfigParser:
     cfg_path = Path(path) if path else DEFAULT_CONFIG
     if not cfg_path.exists():
-        sys.exit(
-            f"[!] Config not found: {cfg_path}\n"
+        raise ConfigError(
+            f"Config not found: {cfg_path}\n"
             f"    Copy config.example.ini to config.ini and fill it in."
         )
     cfg = configparser.ConfigParser()
-    cfg.read(cfg_path, encoding="utf-8")
+    try:
+        cfg.read(cfg_path, encoding="utf-8")
+    except configparser.Error as exc:
+        raise ConfigError(f"Could not parse {cfg_path}: {exc}") from exc
     return cfg
+
+
+def validate_config(cfg: configparser.ConfigParser) -> None:
+    """Raise ConfigError listing every missing/blank required field."""
+    missing: list[str] = []
+    for section, options in REQUIRED_OPTIONS.items():
+        if not cfg.has_section(section):
+            missing.extend(f"{section}.{opt}" for opt in options)
+            continue
+        for opt in options:
+            if not cfg.has_option(section, opt) or not cfg.get(section, opt).strip():
+                missing.append(f"{section}.{opt}")
+    if missing:
+        raise ConfigError(
+            "config.ini is incomplete. Missing/blank required fields: "
+            + ", ".join(missing)
+            + "\n    See config.example.ini for the expected layout."
+        )
 
 
 def redact(value: str | None, mode: str, salt: str) -> str:

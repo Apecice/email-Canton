@@ -34,17 +34,52 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from common import EventLog, iso, load_config, now_utc, redact
+from common import (
+    ConfigError, EventLog, iso, load_config, now_utc, redact, validate_config,
+)
 
 try:
     from imapclient import IMAPClient  # type: ignore
+    from imapclient.exceptions import LoginError as _IMAPClientLoginError  # type: ignore
     HAVE_IMAPCLIENT = True
 except Exception:  # pragma: no cover - optional dependency
     HAVE_IMAPCLIENT = False
+    _IMAPClientLoginError = ()  # type: ignore
 
 import imaplib
 
 _STOP = False
+
+# How long each idle_check slice waits before we re-check the stop flag. Keeps
+# Ctrl-C responsive even when idle_refresh is several minutes.
+IDLE_SLICE_SECONDS = 15
+
+
+class PermanentError(Exception):
+    """A non-retryable error (bad credentials, missing folder). Retrying it
+    forever is pointless and hides the real problem from the user."""
+
+    def __init__(self, kind: str, detail: str):
+        super().__init__(detail)
+        self.kind = kind      # "auth" | "mailbox"
+        self.detail = detail
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """Distinguish "give up and tell the user" from "reconnect and retry".
+
+    - imaplib.IMAP4.abort  -> the connection died; reconnect (TRANSIENT).
+    - imapclient LoginError / imaplib.IMAP4.error -> server rejected us at the
+      protocol level (wrong password, bad mailbox); retrying won't help.
+    - OSError / socket timeout -> network blip; reconnect (TRANSIENT).
+    """
+    if isinstance(exc, imaplib.IMAP4.abort):
+        return False
+    if HAVE_IMAPCLIENT and isinstance(exc, _IMAPClientLoginError):
+        return True
+    if isinstance(exc, imaplib.IMAP4.error):
+        return True
+    return False
 
 
 def _handle_signal(signum, frame):
@@ -53,7 +88,11 @@ def _handle_signal(signum, frame):
     print("\n[*] Stopping after current cycle...", flush=True)
 
 
-HEADER_FIELDS = b"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM TO SUBJECT)]"
+# The ONLY thing we ever fetch from a message. BODY.PEEK = read headers without
+# downloading the body and without setting the \Seen flag. We never request
+# BODY[], BODY[TEXT] or RFC822.TEXT, so message content never leaves the server.
+HEADER_FETCH = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM TO SUBJECT)]"
+FETCH_ITEMS = ["INTERNALDATE", "RFC822.SIZE", HEADER_FETCH]
 
 
 def _parse_headers(raw: bytes) -> dict:
@@ -123,17 +162,79 @@ def _record_message(log: EventLog, st: Settings, kind: str, internaldate: dateti
 # IDLE mode (imapclient)
 # --------------------------------------------------------------------------- #
 
-def run_idle(st: Settings, log: EventLog) -> None:
+def _default_make_client(st: "Settings"):
+    return IMAPClient(st.host, port=st.port, ssl=st.use_ssl, timeout=30)
+
+
+def _establish_idle(st: "Settings", log: EventLog, make_client) -> "IMAPClient":
+    """Connect + login + select. Raises PermanentError for non-retryable
+    problems so the caller can stop instead of looping forever."""
+    log.connection("connect", f"{st.host}:{st.port} ssl={st.use_ssl}", vantage=st.vantage)
+    client = make_client(st)
+    try:
+        client.login(st.user, st.password)
+    except Exception as exc:
+        if _is_permanent_error(exc):
+            raise PermanentError("auth", f"login rejected: {exc!r}") from exc
+        raise
+    log.connection("login_ok", st.user, vantage=st.vantage)
+    try:
+        client.select_folder(st.folder)
+    except Exception as exc:
+        if _is_permanent_error(exc):
+            raise PermanentError("mailbox",
+                                 f"cannot select folder {st.folder!r}: {exc!r}") from exc
+        raise
+    return client
+
+
+def _idle_wait(client, st: "Settings"):
+    """Wait for IDLE activity in small slices so a stop request is honoured
+    quickly. Returns (responses, idle_seconds)."""
+    start = time.monotonic()
+    remaining = st.idle_refresh
+    while remaining > 0 and not _STOP:
+        chunk = min(IDLE_SLICE_SECONDS, remaining)
+        responses = client.idle_check(timeout=chunk)
+        if responses:
+            return responses, time.monotonic() - start
+        remaining -= chunk
+    return [], time.monotonic() - start
+
+
+def _check_alive(client, st: "Settings", log: EventLog) -> bool:
+    """NOOP probe. False means the long-lived connection has silently died --
+    exactly the failure that forces a client restart to receive mail."""
+    try:
+        client.noop()
+        log.connection("noop_ok", "connection still alive", vantage=st.vantage)
+        return True
+    except Exception as exc:
+        log.connection("noop_fail", f"connection is DEAD: {exc!r}", vantage=st.vantage)
+        return False
+
+
+def _handle_new_idle(client, st: "Settings", log: EventLog, seen_max_uid: int) -> int:
+    """After an IDLE wake-up, report genuinely new messages and return the new
+    high-water UID. Filters the IMAP "N:*" quirk that can echo the highest
+    existing UID even when nothing newer arrived."""
+    found = client.search(["UID", f"{seen_max_uid + 1}:*"])
+    new_uids = [u for u in found if u > seen_max_uid]
+    if not new_uids:
+        return seen_max_uid
+    return _report_uids(client, st, log, new_uids, "idle")
+
+
+def run_idle(st: Settings, log: EventLog, make_client=None,
+             max_reconnects: int | None = None) -> None:
+    make_client = make_client or _default_make_client
     backoff = 2
     seen_max_uid = 0
+    reconnects = 0
     while not _STOP:
         client = None
         try:
-            log.connection("connect", f"{st.host}:{st.port} ssl={st.use_ssl}", vantage=st.vantage)
-            client = IMAPClient(st.host, port=st.port, ssl=st.use_ssl, timeout=30)
-            client.login(st.user, st.password)
-            log.connection("login_ok", st.user, vantage=st.vantage)
-            client.select_folder(st.folder)
+            client = _establish_idle(st, log, make_client)
             backoff = 2
 
             # Baseline: highest existing UID so we only report genuinely new mail.
@@ -144,42 +245,38 @@ def run_idle(st: Settings, log: EventLog) -> None:
                            vantage=st.vantage)
 
             while not _STOP:
-                idle_start = time.monotonic()
                 client.idle()
                 log.connection("idle_start", "", vantage=st.vantage)
-                responses = client.idle_check(timeout=st.idle_refresh)
-                idle_dur = time.monotonic() - idle_start
+                responses, idle_dur = _idle_wait(client, st)
                 client.idle_done()
 
                 if responses:
                     log.connection("idle_wake", str(responses)[:200],
                                    idle_seconds=idle_dur, vantage=st.vantage)
-                    new_uids = client.search(["UID", f"{seen_max_uid + 1}:*"])
-                    new_uids = [u for u in new_uids if u > seen_max_uid]
-                    if new_uids:
-                        seen_max_uid = _report_uids(client, st, log, new_uids, "idle")
+                    seen_max_uid = _handle_new_idle(client, st, log, seen_max_uid)
+                elif _STOP:
+                    break
                 else:
-                    # No server traffic for the whole window. Confirm the socket is
-                    # still alive with a NOOP -- this is what catches silent drops.
+                    # No server traffic for the whole window: is the socket alive?
                     log.connection("idle_timeout", f"no activity for {st.idle_refresh}s",
                                    idle_seconds=idle_dur, vantage=st.vantage)
-                    try:
-                        client.noop()
-                        log.connection("noop_ok", "connection still alive",
-                                       vantage=st.vantage)
-                    except Exception as exc:
-                        log.connection("noop_fail", f"connection is DEAD: {exc!r}",
-                                       vantage=st.vantage)
-                        raise
+                    if not _check_alive(client, st, log):
+                        raise imaplib.IMAP4.abort("NOOP failed - connection dead")
 
+        except PermanentError as exc:
+            log.connection(f"{exc.kind}_error", exc.detail, vantage=st.vantage)
+            break
         except KeyboardInterrupt:
             break
         except Exception as exc:
             log.connection("drop", repr(exc), vantage=st.vantage)
             if _STOP:
                 break
+            reconnects += 1
+            if max_reconnects is not None and reconnects >= max_reconnects:
+                break
             log.connection("reconnect_wait", f"{backoff}s", vantage=st.vantage)
-            time.sleep(backoff)
+            _sleep_interruptible(backoff)
             backoff = min(backoff * 2, 60)
         finally:
             if client is not None:
@@ -190,8 +287,7 @@ def run_idle(st: Settings, log: EventLog) -> None:
 
 
 def _report_uids(client, st: Settings, log: EventLog, uids: list[int], kind: str) -> int:
-    data = client.fetch(uids, ["INTERNALDATE", "RFC822.SIZE",
-                               "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM TO SUBJECT)]"])
+    data = client.fetch(uids, FETCH_ITEMS)
     max_uid = max(uids)
     for uid in sorted(uids):
         info = data.get(uid, {})
@@ -213,24 +309,54 @@ def _report_uids(client, st: Settings, log: EventLog, uids: list[int], kind: str
 # Poll mode (stdlib imaplib only)
 # --------------------------------------------------------------------------- #
 
-def run_poll(st: Settings, log: EventLog) -> None:
-    backoff = 2
+def _sleep_interruptible(seconds: float) -> None:
+    slept = 0.0
+    while slept < seconds and not _STOP:
+        step = min(1.0, seconds - slept)
+        time.sleep(step)
+        slept += step
+
+
+def _default_connect_imaplib(st: "Settings"):
+    if st.use_ssl:
+        return imaplib.IMAP4_SSL(st.host, st.port,
+                                 ssl_context=ssl.create_default_context(), timeout=30)
+    return imaplib.IMAP4(st.host, st.port, timeout=30)
+
+
+def _establish_poll(st: "Settings", log: EventLog, connect):
+    log.connection("connect", f"{st.host}:{st.port} ssl={st.use_ssl}", vantage=st.vantage)
+    started = time.monotonic()
+    conn = connect(st)
+    try:
+        conn.login(st.user, st.password)
+    except Exception as exc:
+        if _is_permanent_error(exc):
+            raise PermanentError("auth", f"login rejected: {exc!r}") from exc
+        raise
+    log.connection("login_ok", st.user, idle_seconds=time.monotonic() - started,
+                   vantage=st.vantage)
+    try:
+        conn.select(st.folder, readonly=True)
+    except Exception as exc:
+        if _is_permanent_error(exc):
+            raise PermanentError("mailbox",
+                                 f"cannot select folder {st.folder!r}: {exc!r}") from exc
+        raise
+    return conn
+
+
+def run_poll(st: Settings, log: EventLog, connect=None, sleeper=None,
+             max_cycles: int | None = None) -> None:
+    connect = connect or _default_connect_imaplib
+    sleeper = sleeper or _sleep_interruptible
     seen_uids: set[str] = set()
     primed = False
+    cycles = 0
     while not _STOP:
         conn = None
-        connect_started = time.monotonic()
         try:
-            log.connection("connect", f"{st.host}:{st.port} ssl={st.use_ssl}", vantage=st.vantage)
-            if st.use_ssl:
-                conn = imaplib.IMAP4_SSL(st.host, st.port,
-                                         ssl_context=ssl.create_default_context(), timeout=30)
-            else:
-                conn = imaplib.IMAP4(st.host, st.port, timeout=30)
-            conn.login(st.user, st.password)
-            connect_dur = time.monotonic() - connect_started
-            log.connection("login_ok", st.user, idle_seconds=connect_dur, vantage=st.vantage)
-            conn.select(st.folder, readonly=True)
+            conn = _establish_poll(st, log, connect)
 
             typ, data = conn.uid("search", None, "ALL")
             uids = data[0].split() if data and data[0] else []
@@ -249,9 +375,9 @@ def run_poll(st: Settings, log: EventLog) -> None:
                         seen_uids.add(u)
                 else:
                     log.connection("poll_empty", "no new mail", vantage=st.vantage)
-
-            conn.logout()
-            backoff = 2
+        except PermanentError as exc:
+            log.connection(f"{exc.kind}_error", exc.detail, vantage=st.vantage)
+            break
         except KeyboardInterrupt:
             break
         except Exception as exc:
@@ -263,18 +389,16 @@ def run_poll(st: Settings, log: EventLog) -> None:
                 except Exception:
                     pass
 
-        # Sleep in small slices so Ctrl-C is responsive.
-        slept = 0
-        interval = st.poll_seconds if primed else 1
-        while slept < interval and not _STOP:
-            time.sleep(min(1, interval - slept))
-            slept += 1
+        cycles += 1
+        if max_cycles is not None and cycles >= max_cycles:
+            break
+        if _STOP:
+            break
+        sleeper(st.poll_seconds if primed else 1)
 
 
 def _poll_report(conn: imaplib.IMAP4, st: Settings, log: EventLog, uid: str) -> None:
-    typ, data = conn.uid("fetch", uid,
-                         "(INTERNALDATE RFC822.SIZE "
-                         "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM TO SUBJECT)])")
+    typ, data = conn.uid("fetch", uid, f"({' '.join(FETCH_ITEMS)})")
     internaldate = None
     size = None
     headers: dict = {}
@@ -310,10 +434,20 @@ def main() -> int:
     parser.add_argument("--mode", choices=["idle", "poll"], help="override config mode")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+        validate_config(cfg)
+    except ConfigError as exc:
+        print(f"[!] {exc}", flush=True)
+        return 2
     st = Settings(cfg)
     if args.mode:
         st.mode = args.mode
+
+    if st.redact_mode == "hash" and st.salt.strip().lower() in (
+            "", "changeme", "change-this-to-any-random-string"):
+        print("[!] Warning: [privacy] salt is still the default. Set a unique salt "
+              "in config.ini so hashed identifiers can't be guessed.", flush=True)
 
     if st.mode == "idle" and not HAVE_IMAPCLIENT:
         print("[!] 'imapclient' not installed; falling back to poll mode "
